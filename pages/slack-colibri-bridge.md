@@ -1,171 +1,95 @@
 ---
-title: Slack → Colibri Bridge (Proposal)
+title: Slack → Colibri Bridge
 contributors: Tom Larkworthy
 ---
 
-> **Status:** Draft proposal. Looking for feedback.
+> **Status:** v0 forward path live since 2026-05-31. Bot identity [`@feelingofcomputing.bsky.social`](https://bsky.app/profile/feelingofcomputing.bsky.social) (`did:plc:j7nm3lrd5h7fm3sfhcv3lhfv`). Auto-deployed on push.
 
-A one-way sync that mirrors Slack messages from the FoC Slack workspace into the [Colibri](https://colibri.social) atproto network, so the conversation data ends up public and consumable via the atproto firehose.
+One-way sync from the FoC Slack workspace into the [Colibri](https://colibri.social) atproto network. Every bridged message, reaction, and attachment is a public record on the bot's bsky.social PDS; every raw Slack event is archived losslessly under a `com.feelingofcomputing.bridge.*` lexicon on the same repo.
 
-## Why this shape
+## What's live
 
-- **Lowest-risk path to atproto.** The [social.colibri](https://lexicon.garden/browse/social.colibri) lexicon is the most fleshed-out Slack-shaped lexicon already on atproto. Reusing it lets us playtest Colibri as a Slack replacement without designing a new schema.
-- **Slack stays canonical.** One-way (Slack → atproto). No write-back.
-- **Public by default.** Records on atproto are public.
+Forward path (Slack → atproto), end-to-end:
+
+- **Messages** — rich text → Colibri facets (bold, italic, strikethrough, code, link, channel); 2048-char cap; fallback to plain-text + URL regex for legacy non-`blocks` messages
+- **Mentions** — `@user` resolves to a `social.colibri.richtext.facet#mention` against the user's claimed DID via the [in-source map](https://github.com/tomlarkworthy/slack-sync/blob/main/packages/worker/src/slack-to-did.ts); plain text fallback for unmapped users
+- **Threaded replies** — Slack `thread_ts` → Colibri `parent`
+- **Reactions** add + remove — deterministic per-emoji rkey on the target message
+- **Message edits** — re-derive in place, `putRecord` overwrites, `edited: true` set per the message lexicon
+- **Message deletes** — `deleteRecord` on the derived rkey
+- **File attachments** — fetch `url_private` with bot token → `com.atproto.repo.uploadBlob` → reference in `attachments[]`; 5 MB cap, oversize gets a `[file 'name' too large]` placeholder in the message text
+- **Lossless raw-event archive** — every `event_callback` envelope persisted to `com.feelingofcomputing.bridge.slackRaw` *before* derivation, keyed by `event_id` (idempotent on Slack redelivery)
+
+Out of scope for v0:
+
+- Reverse path (Colibri → Slack)
+- Private channels, DMs
+- Claim flow + posting from claimed DID (v2 below)
+- `slackOrigin` / `slackChannel` / `slackUser` records — lexicons defined below but the v0 worker uses in-source maps instead, accepted trade-off at FoC scale
+- `slackRaw` backfill — only new traffic from 2026-05-31 onward is archived; historical days have derived `social.colibri.message` + `social.colibri.reaction` only
+
+## Code
+
+- **Repo**: [tomlarkworthy/slack-sync](https://github.com/tomlarkworthy/slack-sync) — Bun workspace monorepo
+- **Worker**: [`packages/worker/src/index.ts`](https://github.com/tomlarkworthy/slack-sync/blob/main/packages/worker/src/index.ts) — single Cloudflare Worker; producer (`fetch`) + consumer (`queue`) in one script
+- **Backfill**: [`packages/backfill/src/index.ts`](https://github.com/tomlarkworthy/slack-sync/blob/main/packages/backfill/src/index.ts) — Bun CLI for re-publishing day-files from [Mariano's archive](https://github.com/marianoguerra/Feeling-of-Computing)
+- **Slack app manifest**: [`manifest/slack-app.yaml`](https://github.com/tomlarkworthy/slack-sync/blob/main/manifest/slack-app.yaml)
+- **Deploy**: Cloudflare Workers Builds, push-to-main → auto-deploy
 
 ## Architecture
-
-1. **Slack Events API** pushes message events to a Cloudflare Worker (the *producer*). It verifies Slack's HMAC signature, enqueues the event, and acks within Slack's 3-second budget.
-2. **Cloudflare Queue** holds events durably. A consumer Worker pulls batches and publishes to atproto. Queue retries cover PDS slowness and rate limits.
-3. **atproto is the source of truth.** The bot's bsky.social repo holds the published Colibri messages and our own sidecar records. The PDS is the dedupe authority — see Race resolution.
-4. **Cloudflare D1 (SQLite)** holds:
-   - A single `cache` table — dumb projection of atproto records from any repo, keyed by `(repo, collection, rkey)`, body stored opaquely as JSON. Wipe it and the firehose rebuilds it.
-   - Separate private tables (e.g. `oauth_tokens` in v2) for credentials that can't go on atproto.
-
-The consumer writes records in a fixed order per event: **first** `slackRaw` (lossless capture of the payload as received from Slack), **then** the derived `social.colibri.message`, **then** `slackOrigin` linking the two. If derivation crashes or is later improved, the raw record is still on atproto and the Colibri view can be regenerated without re-pulling Slack. See [slackRaw](#new-comfeelingofbridgeslackraw).
-
-### Sequence diagram
 
 ```mermaid
 sequenceDiagram
   autonumber
   actor U as User in Slack
   participant S as Slack Events API
-  participant P as Producer Worker
+  participant P as Producer (fetch)
   participant Q as CF Queue
-  participant C as Consumer Worker
-  participant DB as D1 cache
+  participant C as Consumer (queue)
   participant PDS as bsky.social PDS<br/>(bot's repo)
-  participant App as Colibri app /<br/>firehose readers
+  participant App as Colibri / firehose readers
 
-  U->>S: send message / reply
+  U->>S: send / edit / delete / react
   S->>P: POST /slack/events
-  P->>P: verify X-Slack-Signature
-  P->>Q: enqueue { event }
+  P->>P: HMAC-verify X-Slack-Signature
+  P->>Q: enqueue { event_callback }
   P-->>S: 200 OK (within 3s)
 
   C->>Q: pull batch
-  C->>DB: SELECT cache<br/>WHERE repo=bot<br/>AND collection='…slackOrigin'<br/>AND rkey='channel-ts'
-  alt cache hit
-    Note over C: already bridged — skip
-  else cache miss
-    C->>PDS: createRecord social.colibri.message
-    PDS-->>C: { uri, cid }
-    C->>PDS: createRecord slackOrigin<br/>(deterministic rkey)
-    alt PDS 200
-      C->>DB: INSERT INTO cache
-    else PDS 409 (concurrent dup)
-      C->>PDS: getRecord slackOrigin
-      PDS-->>C: { record }
-      C->>DB: INSERT INTO cache
-    end
+  C->>PDS: putRecord slackRaw (rkey = event_id)
+  alt event.type = message
+    C->>PDS: putRecord / deleteRecord<br/>social.colibri.message
+  else event.type = reaction_added / removed
+    C->>PDS: putRecord / deleteRecord<br/>social.colibri.reaction
   end
+  C->>Q: ack (or retry → DLQ)
 
   App->>PDS: firehose / fetch
   App-->>U: public conversation visible
 ```
 
-ASCII fallback:
+Notes on the live shape vs. the proposal that preceded it:
 
-```
- Slack user
-    │
-    ▼
- Slack Events API ──▶ Producer Worker (verify, ack <3s)
-                              │
-                              ▼
-                         CF Queue
-                              │
-                              ▼
-                     Consumer Worker
-                              │
-                  SELECT cache (repo, collection, rkey)
-                              │
-                  hit ──┼── miss
-                        ▼     ▼
-                     skip    createRecord(message, slackOrigin)
-                              │
-                     PDS 200  │  PDS 409 (race)
-                       ▼      ▼
-                  INSERT cache    getRecord, INSERT cache
-                              │
-                              ▼
-                       firehose ──▶ Colibri app
-```
-
-## Storage model
-
-atproto holds the public truth. D1 contains:
-
-- A single **`cache`** table — a polymorphic key-value mirror of atproto records from any repo, keyed by `(repo, collection, rkey)` with the record body stored as JSON. Dumb projection: no bridge bookkeeping, no fields that aren't already on atproto. Wipe it and the firehose rebuilds it.
-- Separate **private** tables for state that can't go on atproto (v2 OAuth tokens).
-
-Queries that need particular fields use SQLite's JSON1 functions:
-
-```sql
--- "what's the colibri channel for slack channel C123?"
-SELECT json_extract(record, '$.colibriChannelUri') FROM cache
-WHERE repo = 'did:plc:<bot>'
-  AND collection = 'com.feelingofcomputing.bridge.slackChannel'
-  AND rkey = 'C123';
-```
-
-### Schema sketch
-
-```sql
-CREATE TABLE cache (
-  repo        TEXT NOT NULL,            -- DID of the repo this record lives on
-  collection  TEXT NOT NULL,            -- e.g. 'com.feelingofcomputing.bridge.slackOrigin'
-  rkey        TEXT NOT NULL,
-  record      TEXT NOT NULL,            -- JSON; lexicon-conformant record body
-  cached_at   INTEGER NOT NULL,
-  PRIMARY KEY (repo, collection, rkey)
-);
-
--- v2; private; never on atproto
-CREATE TABLE oauth_tokens (
-  slack_user_id      TEXT PRIMARY KEY,
-  did                TEXT NOT NULL,
-  access_token_enc   BLOB,
-  refresh_token_enc  BLOB NOT NULL,
-  expires_at         INTEGER NOT NULL,
-  scope              TEXT,
-  updated_at         INTEGER NOT NULL
-);
-```
-
-### Race resolution
-
-The PDS is the dedupe authority via the deterministic rkey on `com.feelingofcomputing.bridge.slackOrigin`. The consumer:
-
-1. Check `cache` for `(repo=bot-did, collection='…slackOrigin', rkey='channel-ts')`. Hit → skip.
-2. Miss → `createRecord` on PDS. 200 means we won the race. 409 means another consumer already published; `getRecord` fetches the canonical record.
-3. Either path → INSERT into `cache`.
-
-Cache staleness is the residual risk: an upstream edit on the PDS leaves our row out of date until it's evicted. Our sidecar records are mostly write-once so this is rare in practice; v0 ignores it.
+- **No D1 cache in v0.** The worker writes straight to the PDS and leans on deterministic rkeys + `putRecord` overwrite for idempotency. The D1 binding is reserved in `wrangler.toml` for v0.1+ if cache reads become useful.
+- **slackRaw is the de-facto idempotency boundary.** rkey = sanitised Slack `event_id`; Slack redeliveries hit the same rkey and overwrite identical content.
+- **Message rkey** = `tidFromSlackTs(message.ts)` — edits overwrite in place, deletes target the same rkey.
+- **Reaction rkey** = `tidFromSlackTs(target.ts, hash10('react:' + emoji))` — same emoji on the same message always lands on the same record, so `reaction_removed` can `deleteRecord` without lookup.
 
 ## Lexicons
 
-### Reused: `social.colibri.message`
+### Reused from Colibri
 
-- `text` ← Slack text (truncated to 2048 chars, prefixed `**@user:** ` for attribution — see Identity)
-- `channel` ← via the `com.feelingofcomputing.bridge.slackChannel` sidecar
-- `parent` ← parent's `slackOrigin.messageUri` → rkey
-- `createdAt` ← Slack `ts`
-- `facets` ← mentions, links (v0.1)
-- `attachments` ← deferred (Slack files need blob re-upload)
+- [`social.colibri.message`](https://lexicon.garden/browse/social.colibri.message) — text, facets, createdAt, channel, parent, attachments, edited
+- [`social.colibri.reaction`](https://lexicon.garden/browse/social.colibri.reaction) — emoji, targetMessage
+- [`social.colibri.richtext.facet`](https://lexicon.garden/browse/social.colibri.richtext.facet) — bold, italic, strikethrough, code, link, mention, channel
 
-### New: `com.feelingofcomputing.bridge.slackRaw`
+### Owned: `com.feelingofcomputing.bridge.*`
 
-Lossless archival of the raw Slack event payload. Written **before** any derivation, so the bridge never drops information it doesn't yet know how to render — reactions, edits, attachments, blocks, mrkdwn nuances — even if the v0 Colibri-message derivation ignores most of them. The bot's atproto repo becomes a public, replicable Slack archive that anyone can re-derive a Colibri view from.
+Namespace owned because FoC owns `feelingofcomputing.com/.org/.net`. The archive's lifetime, schema, and ownership belong to FoC, not Colibri — explicit boundary in the lexicon namespace de-risks Colibri lexicon churn (it has a substantial rework in flight on `feat/rework`) and de-risks Colibri disappearing entirely. If either happens, the raw archive on atproto is untouched and re-derivable.
 
-`key: "any"` so the rkey matches the `slackOrigin` rkey for join-free lookup:
+#### Live in v0: `com.feelingofcomputing.bridge.slackRaw`
 
-```
-rkey = `${slackChannelId}-${slackTs.replace('.','-')}`
-```
-
-Edits and reactions update the same record (`putRecord`). v0.1 could split this into per-event-type records (`channelId-ts-eventType-seq`) if we need full event history rather than latest-known state.
+Lossless capture of the full `event_callback` envelope, written *before* any derivation.
 
 ```json
 {
@@ -181,8 +105,8 @@ Edits and reactions update the same record (`putRecord`). v0.1 could split this 
         "properties": {
           "slackChannelId": { "type": "string" },
           "slackTs":        { "type": "string" },
-          "eventType":      { "type": "string", "description": "Slack event subtype: 'message', 'message_changed', 'message_deleted', 'reaction_added', etc." },
-          "payload":        { "type": "unknown", "description": "Raw Slack message object as received (minus auth tokens)." },
+          "eventType":      { "type": "string", "description": "Slack event type: message, message_changed, message_deleted, reaction_added, reaction_removed, etc." },
+          "payload":        { "type": "unknown", "description": "Raw Slack event_callback envelope as received." },
           "capturedAt":     { "type": "string", "format": "datetime" }
         }
       }
@@ -191,25 +115,15 @@ Edits and reactions update the same record (`putRecord`). v0.1 could split this 
 }
 ```
 
-Slack file attachments referenced in `payload.files[]` are not blobbed in v0; their `url_private` is captured but the bytes stay on Slack. v0.1 fetches and re-uploads as atproto blobs, referencing them from the derived `social.colibri.message`.
+rkey = sanitised Slack `event_id`. Slack file attachments referenced in `payload.files[]` are captured by URL only; the bytes are re-uploaded as atproto blobs by the derived `social.colibri.message` path (see [Code → Worker](https://github.com/tomlarkworthy/slack-sync/blob/main/packages/worker/src/index.ts)).
 
-#### Why this lives under `com.feelingofcomputing.*`, not `social.colibri.*`
+#### Designed for v0.1: `slackOrigin`, `slackChannel`, `slackUser`
 
-`slackRaw` is the *FoC community's* archive of its own Slack history. Its lifetime, schema, and ownership belong to FoC — not to Colibri — and we want that boundary explicit in the lexicon namespace. Three practical consequences:
+These three lexicons appear in the design but are **not written by v0**. The worker uses in-source maps (`CHANNEL_MAP` and `SLACK_USER_DID_MAP` in [`packages/worker/src/`](https://github.com/tomlarkworthy/slack-sync/blob/main/packages/worker/src/)) — requires a redeploy on changes but is sufficient at FoC scale (~10 channels, ~15 mapped users). The lexicons below are the spec for when in-source maps stop scaling.
 
-- **De-risks Colibri lexicon churn.** Colibri is actively reworking its lexicons on the `feat/rework` branch (the v1 `src/utils/atproto/lexicons.ts` is deleted there; a new `apps/website/src/utils/atproto/lexicons.ts` is in flight, along with new appview spec, streaming event types, and a refactored Message component tree). If a future Colibri version renames `social.colibri.message`, splits the facet model, or changes the channel/community ownership semantics that drove the constraints in this proposal, the `slackRaw` archive is untouched. We re-run the derivation against the new lexicons and republish — no Slack re-pull, no loss.
-- **De-risks Colibri disappearing.** If Colibri is abandoned, the FoC archive is still complete, public, and addressable on atproto. A different reader (or a static-site generator off `foc-server`-style infrastructure) can render it.
-- **Avoids polluting Colibri's namespace.** Bridge-specific concepts (Slack `ts`, `slack_user_id`, `subtype`) have no business inside `social.colibri.*`. Other Slack-on-Colibri bridges (different communities, different workspaces) would invent their own `com.<community>.bridge.slackRaw` analogues; that's the right shape.
+##### `com.feelingofcomputing.bridge.slackOrigin`
 
-### New: `com.feelingofcomputing.bridge.slackOrigin`
-
-Provenance + dedupe authority. One-to-one with a `social.colibri.message`. `key: "any"` so we control the rkey:
-
-```
-rkey = `${slackChannelId}-${slackTs.replace('.','-')}`
-```
-
-A redelivered Slack event hits a 409 at the PDS — that's what makes the bridge idempotent regardless of cache state. We can't put the deterministic rkey on the message itself: `social.colibri.message` uses `key: "tid"`, which expects monotonically-increasing TIDs per repo — backfilling old Slack history after live messages would be rejected. The sidecar sidesteps this; the message gets a fresh PDS-minted TID, the sidecar's `messageUri` carries the bridge.
+Provenance + dedupe authority. One-to-one with a `social.colibri.message`. `key: "any"` so the rkey is deterministic from Slack identifiers.
 
 ```json
 {
@@ -235,9 +149,9 @@ A redelivered Slack event hits a 409 at the PDS — that's what makes the bridge
 }
 ```
 
-### New: `com.feelingofcomputing.bridge.slackChannel`
+##### `com.feelingofcomputing.bridge.slackChannel`
 
-Slack → Colibri channel mapping. Rkey = Slack channel ID. Created lazily on first sighting of a new Slack channel, after auto-creating the corresponding `social.colibri.channel`.
+Slack channel ID → Colibri channel at-uri mapping. Rkey = Slack channel ID.
 
 ```json
 {
@@ -262,9 +176,9 @@ Slack → Colibri channel mapping. Rkey = Slack channel ID. Created lazily on fi
 }
 ```
 
-### New: `com.feelingofcomputing.bridge.slackUser`
+##### `com.feelingofcomputing.bridge.slackUser`
 
-Identity record. Rkey = sanitised Slack user ID. `claimedDid` starts unset; populated via the claim flow. The OAuth half (v2) does not appear here — those credentials live in a separate D1 table, never on atproto.
+Identity record. Rkey = sanitised Slack user ID. `claimedDid` starts unset; populated via the claim flow when that lands. OAuth credentials (v2) never go on atproto.
 
 ```json
 {
@@ -293,100 +207,71 @@ Identity record. Rkey = sanitised Slack user ID. `claimedDid` starts unset; popu
 
 ## Identity
 
-One bot DID on `bsky.social` (e.g. `feelingof.bsky.social`). The bot owns the Colibri community, every category in it, every channel under those categories, and every bridged message. Attribution for the original Slack speaker lives in the message text body as `@user: ...` (rendered with a mention facet once the speaker has claimed a DID).
+One bot DID. The bot owns the [Feeling of Computing community](at://did:plc:j7nm3lrd5h7fm3sfhcv3lhfv/social.colibri.community/3mn5nudqvhs2x), every category, every bridged channel, and every bridged message. Attribution for the original Slack speaker lives in the message text as `@user: ...` — rendered as a Colibri mention facet once the speaker has claimed a DID.
 
 ### Authorship is immutable
 
 The author of an atproto record is the DID of the repo it lives on. `putRecord` edits content; `deleteRecord` removes a record; nothing reassigns authorship. Consequences:
 
 - All bridged messages stay authored by the bot. Forever.
-- "Post from user's DID" (v2 below) only applies to *new* messages after claim. Hybrid history.
-- Retroactive delete + republish would change the at-uri, breaking links / threads / firehose state. Not recommended.
+- Posting from the user's own DID (v2 below) only applies to *new* messages after claim. Hybrid history.
+- Retroactive delete + republish would change the at-uri, breaking links, threads, firehose state. Not recommended.
 
 ### Channels live in the bot's community
 
-The Colibri appview hard-couples channel ownership to community ownership by author DID. From `jetstream.rs` channel handler:
+The Colibri appview hard-couples channel ownership to community ownership by author DID. From `jetstream.rs`:
 
 ```rust
 let community_uri =
     format!("at://{}/social.colibri.community/{}", did, record.community);
 ```
 
-The community URI an indexed channel belongs to is constructed from the **channel record's author DID** plus the channel's `community` rkey field. A bot-authored channel record can only resolve to a community on the bot's own repo; the appview will not index a bot-authored channel into a community owned by someone else's DID.
+The community URI for an indexed channel is constructed from the **channel record's author DID** plus the channel's `community` rkey field. A bot-authored channel record can only resolve to a community on the bot's own repo; the appview will not index a bot-authored channel into a community owned by a different DID.
 
-Consequences:
-
-- The bot bootstraps and owns its own `social.colibri.community` record. Bridged channels cannot be inserted into a pre-existing third-party community by the bot.
-- Discovery of the bot-owned space happens by linking to the bot's community URI, not by appearing inside an existing community's sidebar.
-- The bot's community + at least one category must exist before any channel lazy-creation. Categories' `channelOrder` is a read-modify-write append per new channel.
-
-#### Inverse pattern: community owner pre-creates channels
-
-The constraint is on the channel record's author DID, not on who writes messages into the channel. So a cooperative community owner can pre-create the bridged channels on their own repo, under their own community + category, and the bot publishes messages referencing those channel rkeys. Validated against the FoC Colibri instance: six Slack channels (`present-company`, `share-your-work`, `thinking-together`, `of-ai`, `devlog-together`, `linking-together`) created by the community owner on `did:plc:j7nm3lrd5h7fm3sfhcv3lhfv` under the Feelingsof community; `trendingnotebooks.bsky.social` (with a `social.colibri.membership` for that community) published a 9-message backfill (1 top-level + 8 thread replies) into `#present-company`. Messages appeared with correct threading.
-
-In this mode the bridge only needs the slack-channel → colibri-channel-rkey mapping; it does no channel-creation, no `social.colibri.community` ownership, no `channelOrder` mutation. The trade-off is one-time manual setup by the community owner and an ongoing convention that the owner adds a Colibri channel whenever a new Slack channel should be bridged.
+v0 went with **bot-owns-community**: the bot bootstraps and owns the community, every category, and every channel. The alternative (community owner pre-creates channels on their own DID, bot authors messages referencing those channel rkeys) was validated end-to-end during proposal but isn't what shipped — the bot-owns-everything path was simpler given the bot also serves as the FoC archival identity.
 
 ### Per-message avatar / displayName
 
 Avatar and displayName come from the actor's profile record — one per DID. With one bot DID, every bridged message renders with the bot's avatar. The Colibri message lexicon has no override fields. Per-user ghost DIDs (Bridgy Fed's approach) would solve this but we reject them for v0/v1: bsky.social account-creation rate limits, and creating DIDs for users without consent.
 
-Upstream ask of Colibri: extend `social.colibri.message` with optional render-time author overrides.
+Single biggest UX gap. See *What would improve v0 next* below.
 
-```json
-"displayAuthor": {
-  "type": "object",
-  "description": "Override author render for bridged messages.",
-  "properties": {
-    "name":   { "type": "string", "maxLength": 64 },
-    "avatar": { "type": "blob", "accept": ["image/jpeg", "image/png"] }
-  }
-}
-```
+### Claim flow (designed, not in v0)
 
-### Claim flow
-
-A user posts `I am did:plc:...` in any bridged Slack channel. The bridge extracts the DID and writes it to the `slackUser.claimedDid` atproto record (and the cache mirrors it). No cryptographic verification in v1 — posting it from their Slack account is the trust signal, and the claim is publicly visible for anyone to challenge.
+A user posts `I am did:plc:...` in any bridged Slack channel. The bridge extracts the DID and writes it to the `slackUser.claimedDid` atproto record. No cryptographic verification in v1 — posting from their Slack account is the trust signal, and the claim is publicly visible for anyone to challenge.
 
 v2 requires a counter-claim record on the claimed DID's repo, verifiable from atproto alone.
 
 ### Posting from the claimed DID (v2)
 
-Once `claimedDid` is set, future messages could be authored from the user's DID. Requires an OAuth credential delegated to the bridge, against the user's PDS — atproto OAuth specifically, not Bluesky app-passwords (which are a bsky.social UX, not portable across PDSes). Refresh tokens are medium-lived; the bridge re-prompts via Slack DM near expiry. Tokens live in D1's `oauth_tokens` table (separate from the atproto cache), encrypted at rest, keyed by Slack user ID.
+Once `claimedDid` is set, future messages could be authored from the user's DID via atproto OAuth (not Bluesky app-passwords — those are a bsky.social UX, not portable across PDSes). Refresh tokens medium-lived; bridge re-prompts via Slack DM near expiry. Tokens live in a private D1 table, encrypted at rest, never on atproto.
 
-### Credential-free alternative: user-driven backfill
+## What would improve v0 next
 
-A claimed user can republish their own messages onto their own repo at any time without granting the bridge anything. The bot's repo is a public archive — pull the `slackOrigin` records matching their `slackUserId`, republish the corresponding messages from their own DID. We ship a small CLI. No trust delegation, full data ownership.
+Upstream changes the bridge benefits from. Until they land, `slackRaw` preserves enough state to re-derive when they do.
 
-## Asks of Colibri
+- **Per-record author override** on `social.colibri.message` and `social.colibri.reaction` — optional `displayAuthor: { name, avatar? }`. Without it every bridged message and every aggregated reaction renders as the bot. Single biggest UX win; unblocks proper reaction multi-reactor counts too.
+- **Collapsed / nested thread rendering** — Colibri's UI is Discourse-flat today. A 30-reply Slack thread becomes 30 sibling rows in the channel scroll. `feat/rework` still renders flat with `parent_message` as a jump-link.
+- **Cross-repo channel ownership** — the appview hard-codes `community_uri = at://{channel_author}/social.colibri.community/{rkey}`. Workaround is bot-owns-community (what we did). Cleaner: a `communityRepo` field on `social.colibri.channel`, or a `social.colibri.delegation` record granting channel-creation to a DID.
+- **Quote facet feature** — Slack `rich_text_quote` blocks render as `> `-prefixed plain text since Colibri's facet set lacks quote.
+- **TID-on-rkey monotonicity assurance** — `social.colibri.message` uses `key: "tid"`. bsky.social tolerates non-monotonic TIDs (otherwise backfill of old Slack history would 409 against live messages). A PDS that strictly enforces monotonicity would break the bridge. Worth a one-line "we don't require monotonic rkeys" assurance in the lexicon docs, or a switch to `key: "any"`.
+- **Lexicon publication** — `com.feelingofcomputing.bridge.*` records currently show "not validated" in atproto-browser. Needs `_lexicon` resolution on `feelingofcomputing.com` or `com.atproto.lexicon.schema` records to publish.
 
-These are upstream changes the bridge benefits from but does not block on. Until they land, `slackRaw` preserves enough state to re-derive when they do.
+## Open
 
-- **Per-record author override** — optional `displayAuthor: { name, avatar? }` on `social.colibri.message` and `social.colibri.reaction`. Without it every bridged message and every aggregated reaction renders as the bot, with attribution hacked into the message text body as `@user: ` and reactions collapsed to a single "@bot reacted" entry per emoji. Single biggest UX win; unblocks proper reaction multi-reactor counts too.
-- **Collapsed / nested thread rendering** — Colibri's current UI is Discourse-flat (every reply is a top-level row referencing a `parent` rkey). Slack's threaded conversations don't survive the trip: a 30-reply thread on one Slack message becomes 30 sibling rows in the channel scroll. Inspected `feat/rework` (substantial monorepo + lexicon rewrite in flight) and the new Message component still renders flat with `parent_message` as a jump-link, not as a collapsed sub-thread. Worth raising as a v2 UX direction.
-- **Cross-repo channel ownership** — the appview hard-codes `community_uri = at://{channel_author}/social.colibri.community/{rkey}`. The bot cannot create channels in a community it does not own. Today's workaround is "community owner pre-creates channels"; cleaner is either a `communityRepo` field on `social.colibri.channel`, or a `social.colibri.delegation` record granting channel-creation to a specific DID.
-- **Quote facet feature** — Slack's `rich_text_quote` blocks render as `> `-prefixed plain text today because Colibri's facet feature set covers bold/italic/strikethrough/code/mention/link/channel but not quote.
-- **Confirm TID-on-rkey monotonicity expectations** — `social.colibri.message` uses `key: "tid"`. `bsky.social` tolerates non-monotonic TIDs on rkeys (otherwise our backfill would 409 against live messages). PDSes that *do* enforce monotonicity would break the bridge. Worth a one-line "we don't require monotonic rkeys" assurance in the lexicon docs, or a switch to `key: "any"`.
-- **Attachment shape clarity** — examples / docs for `social.colibri.message.attachments[]` would unblock our v0.1 file-attachment work.
-
-## Open questions
-
-- Backfill from `dump-history.js` snapshot, or forward-only? All-channels backfill is significant volume.
-- Channel / category layout: single community with flat siblings, or map Slack groupings to Colibri categories? Sidecar is agnostic.
-- Private channels and DMs — out of scope. Bot joins public channels only.
-- Reactions, edits, deletes — v0 publishes one `social.colibri.reaction` per (target_message, emoji) on the bot's repo; multi-reactor counts are preserved losslessly in `slackRaw` and become recoverable once per-record author override lands. Edits: `putRecord` on both `slackRaw` and the message. Deletes: tombstone the message, retain the `slackRaw` for audit.
-- Slack file attachments — `payload.files[]` is preserved in `slackRaw` (including `url_private`) from v0; v0.1 fetches and re-uploads as atproto blobs. bsky.social blob size limits (~1 MB images, ~50 MB video) will force large attachments to external hosting or a more permissive PDS.
-- False DID claims. v1 unverified; v2 requires two-sided counter-claim.
-- OAuth re-auth UX (v2): frequency cap, fallback when user ignores the prompt.
+- **Backfill cadence** — the [archive submodule](https://github.com/marianoguerra/Feeling-of-Computing) updates weekly. There's a 20-day gap between the archive's last day and the live bridge cutover (2026-05-31). Waiting for the next dump before backfilling so the bridged record is gap-free.
+- **False DID claims** — v1 unverified; v2 requires two-sided counter-claim.
+- **OAuth re-auth UX** (v2) — frequency cap, fallback when user ignores the prompt.
 
 ## Prior art
 
-- **[Bridgy Fed](https://fed.brid.gy)** — ActivityPub ↔ atproto. Not applicable directly (Slack isn't ActivityPub) but informs the rejected per-user ghost-DID approach and our `slackOrigin` provenance pattern.
+- **[Bridgy Fed](https://fed.brid.gy)** — ActivityPub ↔ atproto. Not directly applicable (Slack isn't ActivityPub) but informs the rejected per-user ghost-DID approach.
 - **[matrix-appservice-slack](https://github.com/matrix-org/matrix-appservice-slack)** — closest sibling. Same Slack-webhook → ghost-users → federated-protocol shape, targeting Matrix.
-- **Mariano's `scripts/dump-history.js` + `foc-server`** ([repo](https://github.com/marianoguerra/Feeling-of-Computing)) — the existing FoC Slack pipeline runs in a different shape: a Node CLI that pulls `conversations.history` + `conversations.replies` via Slack's REST API on a manual / weekly cadence, writes JSON to `history/YYYY/MM/DD{,.replies}.json`, indexes it into LanceDB with sentence-transformer embeddings, and serves search via a Rust `axum` binary deployed on Ubuntu under systemd behind nginx (see `foc-server/docs/systemd.md`). Pull, not push; ingest-and-reindex, not bridge. Our `slackRaw` lexicon is the atproto-native analog of those committed `history/*.json` dumps — same archival role, public over the firehose instead of `git push`.
+- **Mariano's `scripts/dump-history.js` + `foc-server`** ([repo](https://github.com/marianoguerra/Feeling-of-Computing)) — the existing FoC pipeline pulls `conversations.history` + `conversations.replies` via Slack REST on a weekly cadence, writes JSON to `history/YYYY/MM/DD{,.replies}.json`, indexes into LanceDB with sentence-transformer embeddings, serves search via a Rust `axum` binary on Ubuntu under systemd behind nginx. Pull, not push; ingest-and-reindex, not bridge. The bridge's `slackRaw` lexicon is the atproto-native analog of those `history/*.json` dumps — same archival role, public over the firehose instead of `git push`. The backfill CLI consumes these JSON dumps directly.
 
 ## Related
 
 - [[Projects]] — Colibri and FoC are both listed.
 - [Colibri lexicons](https://lexicon.garden/browse/social.colibri)
 - [Colibri source](https://github.com/colibri-social/colibri.social)
-- [FoC repo](https://github.com/marianoguerra/Feeling-of-Computing) — see `scripts/dump-history.js` for the current Slack puller.
+- [FoC repo](https://github.com/marianoguerra/Feeling-of-Computing)
