@@ -106,7 +106,7 @@ Queries that need particular fields use SQLite's JSON1 functions:
 -- "what's the colibri channel for slack channel C123?"
 SELECT json_extract(record, '$.colibriChannelUri') FROM cache
 WHERE repo = 'did:plc:<bot>'
-  AND collection = 'com.feelingof.bridge.slackChannel'
+  AND collection = 'com.feelingofcomputing.bridge.slackChannel'
   AND rkey = 'C123';
 ```
 
@@ -115,7 +115,7 @@ WHERE repo = 'did:plc:<bot>'
 ```sql
 CREATE TABLE cache (
   repo        TEXT NOT NULL,            -- DID of the repo this record lives on
-  collection  TEXT NOT NULL,            -- e.g. 'com.feelingof.bridge.slackOrigin'
+  collection  TEXT NOT NULL,            -- e.g. 'com.feelingofcomputing.bridge.slackOrigin'
   rkey        TEXT NOT NULL,
   record      TEXT NOT NULL,            -- JSON; lexicon-conformant record body
   cached_at   INTEGER NOT NULL,
@@ -136,7 +136,7 @@ CREATE TABLE oauth_tokens (
 
 ### Race resolution
 
-The PDS is the dedupe authority via the deterministic rkey on `com.feelingof.bridge.slackOrigin`. The consumer:
+The PDS is the dedupe authority via the deterministic rkey on `com.feelingofcomputing.bridge.slackOrigin`. The consumer:
 
 1. Check `cache` for `(repo=bot-did, collection='…slackOrigin', rkey='channel-ts')`. Hit → skip.
 2. Miss → `createRecord` on PDS. 200 means we won the race. 409 means another consumer already published; `getRecord` fetches the canonical record.
@@ -149,13 +149,13 @@ Cache staleness is the residual risk: an upstream edit on the PDS leaves our row
 ### Reused: `social.colibri.message`
 
 - `text` ← Slack text (truncated to 2048 chars, prefixed `**@user:** ` for attribution — see Identity)
-- `channel` ← via the `com.feelingof.bridge.slackChannel` sidecar
+- `channel` ← via the `com.feelingofcomputing.bridge.slackChannel` sidecar
 - `parent` ← parent's `slackOrigin.messageUri` → rkey
 - `createdAt` ← Slack `ts`
 - `facets` ← mentions, links (v0.1)
 - `attachments` ← deferred (Slack files need blob re-upload)
 
-### New: `com.feelingof.bridge.slackRaw`
+### New: `com.feelingofcomputing.bridge.slackRaw`
 
 Lossless archival of the raw Slack event payload. Written **before** any derivation, so the bridge never drops information it doesn't yet know how to render — reactions, edits, attachments, blocks, mrkdwn nuances — even if the v0 Colibri-message derivation ignores most of them. The bot's atproto repo becomes a public, replicable Slack archive that anyone can re-derive a Colibri view from.
 
@@ -170,7 +170,7 @@ Edits and reactions update the same record (`putRecord`). v0.1 could split this 
 ```json
 {
   "lexicon": 1,
-  "id": "com.feelingof.bridge.slackRaw",
+  "id": "com.feelingofcomputing.bridge.slackRaw",
   "defs": {
     "main": {
       "type": "record",
@@ -193,7 +193,7 @@ Edits and reactions update the same record (`putRecord`). v0.1 could split this 
 
 Slack file attachments referenced in `payload.files[]` are not blobbed in v0; their `url_private` is captured but the bytes stay on Slack. v0.1 fetches and re-uploads as atproto blobs, referencing them from the derived `social.colibri.message`.
 
-#### Why this lives under `com.feelingof.*`, not `social.colibri.*`
+#### Why this lives under `com.feelingofcomputing.*`, not `social.colibri.*`
 
 `slackRaw` is the *FoC community's* archive of its own Slack history. Its lifetime, schema, and ownership belong to FoC — not to Colibri — and we want that boundary explicit in the lexicon namespace. Three practical consequences:
 
@@ -201,7 +201,7 @@ Slack file attachments referenced in `payload.files[]` are not blobbed in v0; th
 - **De-risks Colibri disappearing.** If Colibri is abandoned, the FoC archive is still complete, public, and addressable on atproto. A different reader (or a static-site generator off `foc-server`-style infrastructure) can render it.
 - **Avoids polluting Colibri's namespace.** Bridge-specific concepts (Slack `ts`, `slack_user_id`, `subtype`) have no business inside `social.colibri.*`. Other Slack-on-Colibri bridges (different communities, different workspaces) would invent their own `com.<community>.bridge.slackRaw` analogues; that's the right shape.
 
-### New: `com.feelingof.bridge.slackOrigin`
+### New: `com.feelingofcomputing.bridge.slackOrigin`
 
 Provenance + dedupe authority. One-to-one with a `social.colibri.message`. `key: "any"` so we control the rkey:
 
@@ -214,7 +214,7 @@ A redelivered Slack event hits a 409 at the PDS — that's what makes the bridge
 ```json
 {
   "lexicon": 1,
-  "id": "com.feelingof.bridge.slackOrigin",
+  "id": "com.feelingofcomputing.bridge.slackOrigin",
   "defs": {
     "main": {
       "type": "record",
@@ -235,14 +235,14 @@ A redelivered Slack event hits a 409 at the PDS — that's what makes the bridge
 }
 ```
 
-### New: `com.feelingof.bridge.slackChannel`
+### New: `com.feelingofcomputing.bridge.slackChannel`
 
 Slack → Colibri channel mapping. Rkey = Slack channel ID. Created lazily on first sighting of a new Slack channel, after auto-creating the corresponding `social.colibri.channel`.
 
 ```json
 {
   "lexicon": 1,
-  "id": "com.feelingof.bridge.slackChannel",
+  "id": "com.feelingofcomputing.bridge.slackChannel",
   "defs": {
     "main": {
       "type": "record",
@@ -262,14 +262,14 @@ Slack → Colibri channel mapping. Rkey = Slack channel ID. Created lazily on fi
 }
 ```
 
-### New: `com.feelingof.bridge.slackUser`
+### New: `com.feelingofcomputing.bridge.slackUser`
 
 Identity record. Rkey = sanitised Slack user ID. `claimedDid` starts unset; populated via the claim flow. The OAuth half (v2) does not appear here — those credentials live in a separate D1 table, never on atproto.
 
 ```json
 {
   "lexicon": 1,
-  "id": "com.feelingof.bridge.slackUser",
+  "id": "com.feelingofcomputing.bridge.slackUser",
   "defs": {
     "main": {
       "type": "record",
