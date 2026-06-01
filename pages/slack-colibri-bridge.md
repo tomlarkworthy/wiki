@@ -3,9 +3,9 @@ title: Slack → Colibri Bridge
 contributors: Tom Larkworthy
 ---
 
-> **Status:** v0 forward path live since 2026-05-31. Bot identity [`@feelingofcomputing.bsky.social`](https://bsky.app/profile/feelingofcomputing.bsky.social) (`did:plc:j7nm3lrd5h7fm3sfhcv3lhfv`). Auto-deployed on push.
+> **Status:** v0 forward path live since 2026-05-31. Bot identity [`@feelingofcomputing.bsky.social`](https://bsky.app/profile/feelingofcomputing.bsky.social) (`did:plc:4gcxakknd6hxtnhf33miwsob`). Community owned by a separate identity (`did:plc:j7nm3lrd5h7fm3sfhcv3lhfv`). Auto-deployed on push.
 
-One-way sync from the FoC Slack workspace into the [Colibri](https://colibri.social) atproto network. Every bridged message, reaction, and attachment is a public record on the bot's bsky.social PDS; every raw Slack event is archived losslessly under a `com.feelingofcomputing.bridge.*` lexicon on the same repo.
+One-way sync from the FoC Slack workspace into the [Colibri](https://colibri.social) atproto network. Every bridged message, reaction, and attachment is a public record on the bot's bsky.social PDS; every raw Slack event is archived losslessly under a `com.feelingofcomputing.bridge.*` lexicon on the same repo. The bot authors messages into channels owned by a separate community-owner DID — the *inverse pattern* described under [Identity](#identity).
 
 ## What's live
 
@@ -207,7 +207,12 @@ Identity record. Rkey = sanitised Slack user ID. `claimedDid` starts unset; popu
 
 ## Identity
 
-One bot DID. The bot owns the [Feeling of Computing community](at://did:plc:j7nm3lrd5h7fm3sfhcv3lhfv/social.colibri.community/3mn5nudqvhs2x), every category, every bridged channel, and every bridged message. Attribution for the original Slack speaker lives in the message text as `@user: ...` — rendered as a Colibri mention facet once the speaker has claimed a DID.
+Two DIDs are involved:
+
+- **Community owner** (`did:plc:j7nm3lrd5h7fm3sfhcv3lhfv`) owns the [Feeling of Computing community](https://colibri.social) and every category + channel under it.
+- **Bot** (`did:plc:4gcxakknd6hxtnhf33miwsob`, handle `feelingofcomputing.bsky.social`) is a member with a `social.colibri.membership` record; it authors every bridged message into channels owned by the community owner.
+
+Attribution for the original Slack speaker lives in the message text as `@user: ...` — rendered as a Colibri mention facet once the speaker has claimed a DID.
 
 ### Authorship is immutable
 
@@ -228,7 +233,7 @@ let community_uri =
 
 The community URI for an indexed channel is constructed from the **channel record's author DID** plus the channel's `community` rkey field. A bot-authored channel record can only resolve to a community on the bot's own repo; the appview will not index a bot-authored channel into a community owned by a different DID.
 
-v0 went with **bot-owns-community**: the bot bootstraps and owns the community, every category, and every channel. The alternative (community owner pre-creates channels on their own DID, bot authors messages referencing those channel rkeys) was validated end-to-end during proposal but isn't what shipped — the bot-owns-everything path was simpler given the bot also serves as the FoC archival identity.
+v0 went with the **inverse pattern**: the community owner pre-creates the community + every bridged channel under their own DID; the bot only authors messages referencing the channel rkeys. The bot does *not* own the community, channels, or categories. Trade-off: one-time manual setup by the community owner and an ongoing convention that they add a Colibri channel whenever a new Slack channel should be bridged — but the bot's repo stays a pure archival identity, and ownership of the community is decoupled from the bridge's operational lifetime (we could replace the bot identity tomorrow without affecting the community).
 
 ### Per-message avatar / displayName
 
@@ -252,7 +257,7 @@ Upstream changes the bridge benefits from. Until they land, `slackRaw` preserves
 
 - **Per-record author override** on `social.colibri.message` and `social.colibri.reaction` — optional `displayAuthor: { name, avatar? }`. Without it every bridged message and every aggregated reaction renders as the bot. Single biggest UX win; unblocks proper reaction multi-reactor counts too.
 - **Collapsed / nested thread rendering** — Colibri's UI is Discourse-flat today. A 30-reply Slack thread becomes 30 sibling rows in the channel scroll. `feat/rework` still renders flat with `parent_message` as a jump-link.
-- **Cross-repo channel ownership** — the appview hard-codes `community_uri = at://{channel_author}/social.colibri.community/{rkey}`. Workaround is bot-owns-community (what we did). Cleaner: a `communityRepo` field on `social.colibri.channel`, or a `social.colibri.delegation` record granting channel-creation to a DID.
+- **Cross-repo channel ownership** — the appview hard-codes `community_uri = at://{channel_author}/social.colibri.community/{rkey}`. Workaround we used is "community owner pre-creates channels under their own DID, bot authors messages referencing those channel rkeys" (the inverse pattern). Works but requires manual coordination on every new bridged channel. Cleaner: a `communityRepo` field on `social.colibri.channel`, or a `social.colibri.delegation` record granting channel-creation to a DID.
 - **Quote facet feature** — Slack `rich_text_quote` blocks render as `> `-prefixed plain text since Colibri's facet set lacks quote.
 - **TID-on-rkey monotonicity assurance** — `social.colibri.message` uses `key: "tid"`. bsky.social tolerates non-monotonic TIDs (otherwise backfill of old Slack history would 409 against live messages). A PDS that strictly enforces monotonicity would break the bridge. Worth a one-line "we don't require monotonic rkeys" assurance in the lexicon docs, or a switch to `key: "any"`.
 - **Lexicon publication** — `com.feelingofcomputing.bridge.*` records currently show "not validated" in atproto-browser. Needs `_lexicon` resolution on `feelingofcomputing.com` or `com.atproto.lexicon.schema` records to publish.
