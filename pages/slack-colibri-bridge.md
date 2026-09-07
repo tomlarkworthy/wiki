@@ -189,7 +189,8 @@ A reader that knows only the bot repo sees the first two rows; the other 62 reco
           "cid":     { "type": "string", "description": "Record cid at the time of the event; absent for a delete." },
           "channel": { "type": "string", "description": "FoC channel as the pre-migration rkey the bridge writes." },
           "via":     { "type": "string", "enum": ["slack", "colibri"], "description": "Which half logged it." },
-          "at":      { "type": "string", "format": "datetime", "description": "When the bridge observed the change." }
+          "at":      { "type": "string", "format": "datetime", "description": "When the bridge observed the change; on a backfilled entry, the record's own time." },
+          "backfill":{ "type": "boolean", "description": "Entry synthesised from a record that already existed, not logged as it happened." }
         }
       }
     }
@@ -202,7 +203,19 @@ A reader that knows only the bot repo sees the first two rows; the other 62 reco
 - **It does not replace `slackMirror`.** That map is keyed by the source rkey and rewritten in place, because Slack's `ts` cannot be chosen and the mapping must survive queue redelivery. Rewriting in place is what a log must not do: an edit leaves the rkey where it was and a delete removes it, so a newest-first tail sees neither. Both collections are kept and they answer different questions.
 - **Logged before the Slack call**, so an unmapped channel, a missing scope or a trip to the DLQ cannot drop from the feed a record that exists on atproto. The cost is the duplicate a queue retry produces, so a reader must be idempotent on `subject`; merging records by uri already is.
 - **A delete commit carries no record body**, so a native delete is logged only where a `slackMirror` row proves the record was FoC's. A record the bridge never mirrored cannot be told apart from another community's.
-- **Not backfilled.** The feed starts empty at deploy and describes changes from then on. The 1182 messages and 633 reactions already written still need one union crawl over the bot repo and the 23 member repos.
+- **Backfilled by `packages/backfill/src/events.ts`.** One `create` per record that already existed, both directions, so a reader needs the feed and nothing else. Dry run by default; `--live` needs `BSKY_HANDLE` and `BSKY_APP_PASSWORD`. Counted 2026-09-07:
+
+  ```
+  messages read        1186
+  reactions read        635
+  skipped, not FoC's     25   member repos hold their other communities too
+  reactions w/o channel  13   target message no longer exists; channel omitted
+  to write             1785
+  ```
+
+  A backfilled entry's rkey comes from the **subject's** TID, not from now, so the entries interleave in content order and all sort before the ones the live bridge has minted since deploy. A tailer's "stop at the last rkey I hold" therefore keeps working across the switch-over. `backfill: true` and `at` = the record's own time say the entry was reconstructed rather than observed.
+
+  A create costs 3 of the PDS's 5000 points per hour, so `--limit` defaults to 1600 and the run stops there. Re-running resumes: every subject already in the collection is skipped.
 
 ## Maintenance
 
